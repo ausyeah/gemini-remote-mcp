@@ -33,7 +33,25 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.environ.get("GEMINI_MCP_ROOT") or os.path.join(os.path.expanduser("~"), "gemini-remote-work")
 os.makedirs(ROOT, exist_ok=True)
 PORT = int(os.environ.get("GEMINI_MCP_PORT", "8787"))
-PIN = os.environ.get("GEMINI_MCP_PIN") or "".join(secrets.choice("0123456789") for _ in range(6))
+STATE_FILE = os.path.join(BASE_DIR, "state.json")
+
+
+def _load_pin():
+    """授权 PIN：优先环境变量，其次复用已保存的 pin.txt，都没有才随机生成。"""
+    env = os.environ.get("GEMINI_MCP_PIN", "").strip()
+    if env:
+        return env
+    try:
+        with open(os.path.join(BASE_DIR, "pin.txt"), encoding="utf-8") as f:
+            saved = f.read().strip()
+        if saved:
+            return saved
+    except FileNotFoundError:
+        pass
+    return "".join(secrets.choice("0123456789") for _ in range(6))
+
+
+PIN = _load_pin()
 # 可选：显式声明公网域名，使 OAuth metadata 不依赖客户端传入的 Host 头
 PUBLIC_HOST = os.environ.get("GEMINI_MCP_PUBLIC_HOST", "").strip().lower()
 AUDIT_LOG = os.environ.get("GEMINI_MCP_AUDIT_LOG") or os.path.join(BASE_DIR, "audit.log")
@@ -74,14 +92,41 @@ def audit(event):
         pass
 
 
+def _load_state():
+    """启动时恢复已注册客户端与 token，服务重启后 Gemini 无需重新授权。"""
+    try:
+        with open(STATE_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return
+    CLIENTS.update(data.get("clients") or {})
+    TOKENS.update(data.get("tokens") or {})
+
+
+def _save_state():
+    """持久化客户端与 token。写盘失败只记审计，不影响主流程。"""
+    try:
+        tmp = STATE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"clients": CLIENTS, "tokens": TOKENS}, f)
+        os.replace(tmp, STATE_FILE)
+    except OSError as e:
+        audit("state save failed: " + str(e))
+
+
 def sweep():
     """惰性清理过期的授权码与 token，避免长期运行内存增长。"""
     now = time.time()
+    changed = False
     with LOCK:
         for k in [k for k, v in AUTH_CODES.items() if v["expires"] < now]:
             AUTH_CODES.pop(k, None)
+            changed = True
         for k in [k for k, v in TOKENS.items() if v["expires"] < now]:
             TOKENS.pop(k, None)
+            changed = True
+    if changed:
+        _save_state()
 
 
 TOOLS = [
@@ -239,6 +284,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         client_id = "gc_" + secrets.token_hex(8)
         CLIENTS[client_id] = {"redirect_uris": ruri, "client_name": str(body.get("client_name") or "unknown-client")[:80]}
+        _save_state()
         self._json({"client_id": client_id, "client_id_issued_at": int(time.time()), "client_name": CLIENTS[client_id]["client_name"], "redirect_uris": ruri, "token_endpoint_auth_method": "none", "grant_types": ["authorization_code"], "response_types": ["code"]}, 201)
 
     def _authorize_page(self):
@@ -337,6 +383,7 @@ class Handler(BaseHTTPRequestHandler):
             token = "gt_" + secrets.token_hex(24)
             TOKENS[token] = {"client_id": rec["client_id"], "expires": time.time() + 86400 * 7, "scope": rec.get("scope", "mcp")}
         audit("token issued for client " + rec["client_id"])
+        _save_state()
         self._json({"access_token": token, "token_type": "Bearer", "expires_in": 86400 * 7, "scope": rec.get("scope", "mcp")})
 
     def _authed(self):
@@ -414,10 +461,17 @@ class Handler(BaseHTTPRequestHandler):
                 CMD_SEMAPHORE.release()
         raise ValueError("未知工具: " + str(name))
 
+_load_state()
+
 def main():
     pin_file = os.path.join(BASE_DIR, "pin.txt")
-    with open(pin_file, "w", encoding="utf-8") as f:
-        f.write(PIN)
+    try:
+        cur = open(pin_file, encoding="utf-8").read().strip()
+    except FileNotFoundError:
+        cur = ""
+    if cur != PIN:
+        with open(pin_file, "w", encoding="utf-8") as f:
+            f.write(PIN)
     audit("server started, port=" + str(PORT) + ", root=" + ROOT)
     print("[gemini-mcp] 工作目录 = " + ROOT)
     print("[gemini-mcp] 本轮授权 PIN = " + PIN)

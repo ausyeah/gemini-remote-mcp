@@ -45,7 +45,7 @@
 | 传输 | 全程 HTTPS（Cloudflare 边缘 TLS） |
 | 服务 | 仅绑定 127.0.0.1，不监听公网 |
 | 协议 | OAuth 2.1：动态客户端注册 + PKCE(S256)，token 有效期 7 天 |
-| 信任 | Gemini 侧可随时"禁止"/移除连接器；服务端重启即清空全部 token |
+| 信任 | Gemini 侧可随时"禁止"/移除连接器；token 持久化在本地 state.json，服务重启自动恢复，Gemini 无需重新授权 |
 
 ## 快速开始（3 条命令 + 1 分钟 Gemini 配置）
 
@@ -94,7 +94,7 @@ start.bat
 
 - `run_command` 以**你的用户身份执行任意命令**——这就是本项目的功能本身。授权有三层（隧道不公开、PIN、Gemini 侧随时可禁用），但请务必理解你授予了什么
 - **PIN 与隧道地址不要发到任何公开场合**；本仓库文件不含你的任何个人运行时信息
-- token 存内存，服务重启即失效；连接器可在 Gemini「关联的应用」随时移除
+- token 持久化在本地 state.json（已 gitignore），重启自动恢复、PIN 也复用不变；想立刻吊销全部授权就删掉 state.json 并重启
 - PIN 错误 5 次（5 分钟窗口）会暂时锁定；审计日志写入 `audit.log`（超过 1MB 轮转为 `audit.log.1`），记录 PIN 校验、token 签发与执行的命令
 - 可选环境变量：`GEMINI_MCP_PORT`、`GEMINI_MCP_ROOT`、`GEMINI_MCP_PIN`、`GEMINI_MCP_PUBLIC_HOST`（显式声明公网域名，避免 OAuth 元数据被 Host 头注入）、`GEMINI_MCP_AUDIT_LOG`
 - `stop.bat` 只停止本次由 `start.bat` 启动的进程（依据 `server.pid` / `tunnel.pid`），不会误杀机器上其它 cloudflared

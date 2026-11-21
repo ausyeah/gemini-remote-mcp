@@ -25,8 +25,7 @@ if exist "cloudflared.exe" (
     )
 )
 
-:: 清理旧日志与旧 PIN，避免读取到过期信息
-if exist "pin.txt" del /f /q "pin.txt" >nul 2>&1
+:: 清理旧日志与旧进程记录；pin.txt 保留复用（重启后 PIN 不变，避免重新配置）
 if exist "server.log" del /f /q "server.log" >nul 2>&1
 if exist "tunnel.log" del /f /q "tunnel.log" >nul 2>&1
 if exist "server.pid" del /f /q "server.pid" >nul 2>&1
