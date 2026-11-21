@@ -1,142 +1,215 @@
-# Gemini 远程工作（gemini-remote-mcp）纯手动配置教程
+# Gemini 远程工作 · 小白上手教程
 
-本教程介绍如何在 Windows 电脑上通过本地 MCP 服务与 Cloudflare 临时隧道，将本机能力安全接入网页端或手机端 Gemini，实现远程执行命令、读取文件与安排定时任务。
+这份教程假设你**不懂代码、不懂命令行**也能照着做完。全程只用到「下载文件、双击、复制粘贴、点按钮」。
 
 ---
 
-## 1. 环境要求
+## 先看这里：最短上手路径
 
-- **操作系统**：Windows 10 / Windows 11（64 位）
-- **Python**：Python 3.10 及以上版本（安装时建议勾选 `Add Python to PATH`）
-- **网络环境**：可正常访问 GitHub、Cloudflare 及 Gemini 网页端
+1. 按「二、准备工作」装好 Python、下载项目、放好 `cloudflared.exe`（**只需做一次**）。
+2. 以后每次想用：双击 **`start.bat`** → 窗口会告诉你 **PIN** 和 **网址** → 不要关窗口。
+3. 在 Gemini 里填入网址、输入 PIN → 关联成功 → 开始使唤它。
+4. 用完：双击 **`stop.bat`** 关闭。
 
-可在终端执行以下命令确认 Python 版本：
+> 看不懂上面的英文没关系，照着下面的步骤点就行。
 
-```cmd
-python --version
+---
+
+## 一、这东西到底是什么（大白话版）
+
+可以把它理解成：给 Gemini 装了一个**遥控器**，让它在手机上就能操作你这台电脑。
+
+| 名词 | 大白话解释 |
+| --- | --- |
+| **PIN** | 一次性门禁密码。每次启动都会随机生成 6 位数字，只有你知道，别人猜不到。 |
+| **隧道 / 网址** | 给你家电脑临时申请的一个公开门牌号，让 Google 能找到它。每次重启都会换一个。 |
+| **连接器** | Gemini 设置里的一个小工具，填上门牌号就能连上你这台电脑。 |
+| **token** | 关联成功后发的「通行证」，7 天内有效；电脑重启就作废，需要重新关联。 |
+
+数据怎么走：手机 Gemini → Google 云 → 公开网址 → 你的电脑。你的电脑**只接受这一个通道**，不直接暴露在公网上。
+
+---
+
+## 二、准备工作（只做一次）
+
+### 1. 装 Python
+
+1. 打开 <https://www.python.org/downloads/>，点黄色按钮 **Download Python**。
+2. 双击下载的安装包，**务必勾选 `Add Python to PATH`**（安装器底部，很容易漏掉），然后点 **Install Now**。
+3. 装完打开「开始菜单」搜索 `cmd` 回车，输入下面这行再回车：
+
+   ```cmd
+   python --version
+   ```
+
+   看到类似 `Python 3.12.8` 就成功了。如果提示「不是内部或外部命令」，说明第 2 步的勾选漏了，重新安装一遍。
+
+### 2. 下载本项目
+
+1. 打开 <https://github.com/ausyeah/gemini-remote-mcp>。
+2. 点绿色按钮 **Code** → **Download ZIP** → 解压到一个好找的地方，比如桌面上的 `gemini-remote-mcp` 文件夹。
+   - 也会用 git 的话，`git clone https://github.com/ausyeah/gemini-remote-mcp` 更方便以后更新。
+
+### 3. 下载 cloudflared（隧道工具）
+
+1. 打开 <https://github.com/cloudflare/cloudflared/releases/latest>。
+2. 找到 **Windows amd64** 版本的 `cloudflared-windows-amd64.exe`，下载下来。
+3. 把它**重命名**为 `cloudflared.exe`，然后拖进刚才的项目文件夹（和 `start.bat` 放在一起）。
+
+此时项目文件夹里至少有：
+
+```text
+gemini-remote-mcp\
+  ├─ mcp_server.py
+  ├─ start.bat
+  ├─ stop.bat
+  ├─ README.md
+  └─ cloudflared.exe   ← 刚放进去的
 ```
 
 ---
 
-## 2. 下载 `mcp_server.py` 与 `cloudflared`
+## 三、每次使用：启动服务
 
-1. **准备项目目录**  
-   在本地创建一个工作目录（例如 `C:\Users\<你的用户名>\gemini-remote-mcp\`），将本仓库中的 `mcp_server.py`（以及 `README.md`、`PROMPT.md`）下载或克隆到该目录。
+1. 打开项目文件夹，**双击 `start.bat`**。
+2. 会弹出一个黑色窗口，等 5～20 秒（它在自动启动服务和隧道）。
+3. 看到类似下面的内容就成功了：
 
-2. **下载 `cloudflared`**  
-   - 前往 [Cloudflare cloudflared Releases](https://github.com/cloudflare/cloudflared/releases/latest) 下载 Windows 64 位版本 `cloudflared-windows-amd64.exe`。
-   - 将其重命名为 `cloudflared.exe`，直接放入 `gemini-remote-mcp` 项目根目录（或使用 `winget install Cloudflare.cloudflared` 安装到系统路径）。
+   ```text
+   [成功] 当前授权 PIN：123456
+   启动完成！请在 Gemini 网页端填入以下信息：
+     隧道地址：https://abcd-efgh-xxxx.trycloudflare.com/mcp
+     授权 PIN：123456
+   ```
 
-3. **检查目录文件**  
-   进入项目目录，确认至少包含：
-   - `mcp_server.py`
-   - `cloudflared.exe`
+4. **把窗口里的 PIN 和隧道地址记下来**（也可以用手机拍个屏），窗口**不要关**——关了就等于把"遥控器"关了。
+
+> 如果窗口一闪而过，或者提示找不到 python / cloudflared，请看「七、常见问题」。
 
 ---
 
-## 3. 启动本地 MCP 服务（附 PIN 来源说明）
+## 四、在 Gemini 里关联（真人操作，AI 代替不了）
 
-在项目目录下打开终端（PowerShell 或 CMD），执行：
+用电脑或手机浏览器打开 <https://gemini.google.com>，按下面点：
+
+1. 左下角（手机端在侧边栏）找到 **关联应用** / **Tools**（工具），点进去。
+2. 找到 **+ 自定义**（Custom），点它。
+3. 在 **网址 / URL** 那一栏，粘贴第三步记下的隧道地址，**必须带 `/mcp` 结尾**，例如：
+
+   ```text
+   https://abcd-efgh-xxxx.trycloudflare.com/mcp
+   ```
+
+4. 点 **下一步**。出现风险提示时，勾选「我了解风险」之类的确认框。
+5. 点 **关联 / Connect**。
+6. 浏览器会跳出一个写着「允许远程工作连接?」的授权页面。
+7. 在输入框里填第三步记下的 **6 位 PIN**，点绿色按钮 **允许 (Approve)**。
+8. 页面跳回 Gemini，关联成功。
+
+> 如果 AUTHORIZE 页面报 `authorize failed`，看「七、常见问题」第 4 条。
+
+---
+
+## 五、测试一下是否真的通了
+
+在 Gemini 新开一个对话，先 `@` 一下你刚关联的连接器（名字可能叫 `Gemini Remote Work` 或类似），然后粘贴下面这段：
+
+```text
+请在这台电脑上运行 python --version 和 whoami，把真实输出原样返回给我。
+```
+
+如果 Gemini 返回了类似 `Python 3.12.8` 和你电脑用户名的真实结果，说明整条链路通了。
+
+再试一个中文的：
+
+```text
+请列出工作目录里的文件，并读取 README.md 的前 5 行给我。
+```
+
+---
+
+## 六、不用了怎么关
+
+- **推荐**：双击项目文件夹里的 **`stop.bat`**。它只关掉你这次启动的服务和隧道，不会影响电脑上其它程序。
+- 下次想再用，重新双击 `start.bat`，PIN 和网址都会换新的，需要按第四步**重新关联一次**（Gemini 里旧的网址已失效）。
+
+> 提醒：隧道网址每次重启都会变，这是正常的，不是坏了。
+
+---
+
+## 七、常见问题（小白版）
+
+**1. 双击 `start.bat` 窗口一闪而过**
+多半是 Python 没装好或没勾 `Add Python to PATH`。回到「二、1」重装一遍，然后重新双击。
+
+**2. 提示「未找到 cloudflared.exe」**
+说明 `cloudflared.exe` 没放进项目文件夹（和 `start.bat` 同一层），或者名字拼错了。检查文件名是不是完全一致。
+
+**3. 没看到 6 位 PIN**
+打开项目文件夹里的 `pin.txt`，里面写着当前 PIN。如果文件不存在，看 `server.log` 有没有报错。
+
+**4. 授权页报 `authorize failed`**
+旧版本有编码 bug。先把项目更新到最新版（`git pull` 或重新下载 ZIP），再双击 `start.bat` 重试。
+
+**5. 总是提示 `401 Unauthorized`**
+说明电脑这边的服务重启过、之前的通行证作废了。去 Gemini 的关联应用里**取消关联**，然后按第四步重新关联一次，输入新 PIN。
+
+**6. 隧道地址打不开 / 连不上**
+每次重启 `start.bat` 都会换新网址，旧的立即失效。用新窗口里显示的地址，在 Gemini 里更新 URL 后重新关联。
+
+**7. PIN 输错 5 次后被锁**
+为了防坏人乱猜，PIN 连续错 5 次会锁 5 分钟。等 5 分钟再试，或者双击 `stop.bat` 再 `start.bat` 重启服务（PIN 会换新）。
+
+**8. 命令输出中文乱码**
+新版本已经自动处理，一般不会再乱码。如果手动直接调用 cmd 仍乱码，在命令前加 `chcp 65001 && `。
+
+**9. 想换端口（默认 8787）**
+高级操作：在双击 `start.bat` 前，先设置一个叫 `GEMINI_MCP_PORT` 的环境变量为你想要的端口（比如 9000），脚本会自动让服务和隧道都用这个端口。不懂的话保持默认即可。
+
+---
+
+## 八、进阶：让 Gemini 定时干活（可选）
+
+关联成功后，可以用 Gemini 的 **任务 / 已安排（Scheduled Actions）**：
+
+- 「每天早上 9 点检查工作目录新增文件并汇总发给我」
+- 「每周五花 10 分钟调研某个主题，把报告写到 report.md」
+
+注意：定时任务执行时，你的电脑必须**开机、联网，且 `start.bat` 的窗口没关**。
+
+---
+
+## 九、安全须知（重要）
+
+- `run_command` 会以**你的身份执行任意命令**——这就是本项目的功能，但也意味着 Gemini 能操作你的文件。别把 PIN、隧道网址发给任何人。
+- 不要删除、上传或公开 `pin.txt`、`server.log`、`tunnel.log`、`audit.log`（`.gitignore` 已默认忽略它们）。
+- 高风险操作（删文件、改系统设置）建议先让 Gemini 跟你确认再执行。
+- 不用的时候双击 `stop.bat`，减少暴露时间。
+
+---
+
+## 十、手动启动（不想用脚本时）
+
+如果你更想自己敲命令，在项目文件夹里开两个终端窗口：
+
+窗口 1（服务）：
 
 ```cmd
 python mcp_server.py
 ```
 
-- **PIN 来源说明**：服务启动后会自动生成一次性授权 **PIN**，同时在控制台输出并写入同目录下的 `pin.txt` 文件中。
-- 后续在 Gemini 授权页面输入 PIN 时，请直接查看控制台日志或打开 `pin.txt` 获取当前有效的 PIN。
-- 保持该终端窗口运行，不要关闭。
-
----
-
-## 4. 启动 Cloudflare 临时隧道
-
-**另开一个终端窗口**，进入同一项目目录，执行以下命令将本地服务端口（`mcp_server.py` 默认监听 `8787`）映射到公网：
+窗口 2（隧道）：
 
 ```cmd
 cloudflared.exe tunnel --url http://127.0.0.1:8787
 ```
 
-等待数秒后，终端日志中会出现类似如下格式的临时公网地址：
-
-```text
-https://<random-subdomain>.trycloudflare.com
-```
-
-> 提示：Quick Tunnel 每次重启都会分配新的随机域名。如需保存日志方便排查，可加上 `--logfile tunnel.log`。
+PIN 看窗口 1 或 `pin.txt`，网址看窗口 2。用完在两个窗口按 `Ctrl + C`。
 
 ---
 
-## 5. 在 Gemini 网页端关联自定义连接器
+## 十一、彻底卸载
 
-按以下顺序在浏览器中完成关联：
-
-1. 打开 Gemini 网页端，进入连接器 / 扩展管理页面，选择 **自定义**。
-2. 在 URL 输入框中填入隧道地址并拼接 MCP 路径：
-   ```text
-   https://<random-subdomain>.trycloudflare.com/mcp
-   ```
-3. 点击 **下一步**。
-4. 在工具/权限列表中 **勾选** 需要开放给 Gemini 的功能。
-5. 点击 **关联**。
-6. 浏览器跳转到本地服务的授权确认页后，输入 `pin.txt` 中的 **PIN**。
-7. 点击 **允许**，等待页面提示关联成功即可返回 Gemini 对话框。
-
----
-
-## 6. 验收命令
-
-关联完成后，可以在电脑端或手机端 Gemini 对话框发送以下测试指令进行验收：
-
-- **基础连通性验收**：
-  > 请通过已关联的远程电脑工具，执行 `python --version` 和 `whoami`，把结果原样返回给我。
-- **中文路径与编码验收**：
-  > 请查看当前项目目录下有哪些文件，并读取 `README.md` 的前 5 行内容。
-
-如果 Gemini 能准确返回本机的真实输出，说明整条链路已打通。
-
----
-
-## 7. 「任务 / 已安排」进阶用法
-
-打通远程连接后，你可以结合 Gemini 的 **任务 / 已安排（Scheduled Actions）** 功能，实现自动化远程巡检或定时处理，例如：
-
-- **每日定时巡检**：每天固定时间自动检查本地磁盘空间、服务日志（`server.log`）或指定目录状态，并汇总发送给你。
-- **定时文件整理**：定期扫描下载目录或指定工作目录，按规则分类或生成当日工作简报。
-- **开发辅助**：在外出时通过手机让 Gemini 定时拉取最新代码、跑一次单元测试并汇报结果。
-
-> 注意：使用定时任务期间，需确保电脑处于开机联网状态，且 `mcp_server.py` 与 `cloudflared` 保持运行。
-
----
-
-## 8. 常见问题（FAQ）
-
-### Q1：遇到 `401 Unauthorized` 报错怎么办？
-**原因**：本地服务重启后生成了新的 PIN，或之前的授权凭证已失效。  
-**解决**：在 Gemini 连接器设置中取消当前关联，重新点击 **关联**，并在授权页输入最新的 `pin.txt` 中的 PIN 即可。
-
-### Q2：重启隧道后连不上怎么办（隧道换址重连）？
-**原因**：`cloudflared` 的 Quick Tunnel（`trycloudflare.com`）每次关闭重开都会分配全新的随机域名，旧地址立即失效。  
-**解决**：从新的 `cloudflared` 输出（或 `tunnel.log`）复制最新公网地址，在 Gemini 自定义连接器中更新 URL 为 `https://<新域名>.trycloudflare.com/mcp` 后重新关联。
-
-### Q3：Windows CMD 输出中文变成乱码怎么办？
-**原因**：Windows CMD 默认代码页为 GBK（936），而服务与脚本默认使用 UTF-8。  
-**解决**：在执行命令前先运行 `chcp 65001` 将终端切换为 UTF-8 代码页；若由 Gemini 远程下发命令，也可在提示词或命令前缀中加上 `chcp 65001 && ...`。
-
-### Q4：安全边界有哪些注意事项？
-- **切勿泄露凭证**：不要将 `pin.txt`、`server.log`、`tunnel.log` 上传到 GitHub 或任何公开平台（`.gitignore` 已默认忽略）。
-- **用完即关**：无需远程操控时，及时关闭服务与隧道进程，缩小公网暴露窗口。
-- **最小权限原则**：仅在可信的个人账号下关联，对高风险的删除、系统配置修改等操作，建议在系统提示词（`PROMPT.md`）中要求 Gemini 执行前先向你二次确认。
-
----
-
-## 9. 停止与回滚
-
-### 停止服务
-- **手动停止**：分别在运行 `mcp_server.py` 和 `cloudflared.exe` 的两个终端窗口中按 `Ctrl + C` 终止进程。
-- **脚本停止**：如果使用了仓库提供的脚本，直接双击或运行 `stop.bat` 即可一键结束两个进程。
-
-### 回滚与清理
-如需完全撤回本次配置：
-1. 停止本地 MCP 服务与 `cloudflared` 隧道进程。
-2. 在 Gemini 网页端设置中删除/取消关联该自定义连接器。
-3. 删除本地目录中的临时文件 `pin.txt`、`server.log`、`tunnel.log`（如需彻底移除，删除整个项目文件夹即可）。
+1. 双击 `stop.bat` 关闭服务和隧道。
+2. 在 Gemini 的关联应用里删除这个自定义连接器。
+3. 删除整个项目文件夹即可。

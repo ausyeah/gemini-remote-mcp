@@ -29,9 +29,13 @@ if exist "cloudflared.exe" (
 if exist "pin.txt" del /f /q "pin.txt" >nul 2>&1
 if exist "server.log" del /f /q "server.log" >nul 2>&1
 if exist "tunnel.log" del /f /q "tunnel.log" >nul 2>&1
+if exist "server.pid" del /f /q "server.pid" >nul 2>&1
+if exist "tunnel.pid" del /f /q "tunnel.pid" >nul 2>&1
 
 echo [1/2] 正在启动本地 MCP 服务...
 start "gemini-mcp-server" /b cmd /c "python -u mcp_server.py > server.log 2>&1"
+:: 记录本次启动的服务 PID，供 stop.bat 精确停止，避免误伤其它 python 进程
+powershell -NoProfile -Command "$p = Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'python.exe' -and $_.CommandLine -like '*mcp_server.py*' } | Sort-Object CreationDate -Descending | Select-Object -First 1; if ($p) { $p.ProcessId | Out-File -FilePath 'server.pid' -Encoding ascii -NoNewline }"
 
 set "PIN_VAL="
 for /l %%i in (1,1,15) do (
@@ -53,6 +57,8 @@ echo [2/2] 正在启动 Cloudflare 临时隧道...
 :: 隧道端口必须与 mcp_server.py 的监听端口一致；未显式设置时默认 8787
 if not defined GEMINI_MCP_PORT set "GEMINI_MCP_PORT=8787"
 start "gemini-cloudflared" /b cmd /c ""%CF_CMD%" tunnel --url http://127.0.0.1:%GEMINI_MCP_PORT% --logfile tunnel.log >nul 2>&1"
+:: 记录本次启动的隧道 PID
+powershell -NoProfile -Command "$p = Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'cloudflared.exe' -and $_.CommandLine -like '*127.0.0.1:%GEMINI_MCP_PORT%*' } | Sort-Object CreationDate -Descending | Select-Object -First 1; if ($p) { $p.ProcessId | Out-File -FilePath 'tunnel.pid' -Encoding ascii -NoNewline }"
 
 set "TUNNEL_URL="
 for /l %%i in (1,1,20) do (

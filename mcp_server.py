@@ -1,9 +1,32 @@
 # -*- coding: utf-8 -*-
-import base64, hashlib, html as html_mod, json, os, secrets, subprocess, threading, time, urllib.parse
+import base64, hashlib, html as html_mod, json, os, secrets, subprocess, tempfile, threading, time, urllib.parse
 
 
 def html_escape(s):
     return html_mod.escape(str(s), quote=True)
+
+
+class TooLarge(Exception):
+    pass
+
+
+def valid_redirect_uri(uri):
+    """仅允许 https 与回环 http，并拒绝控制字符，防止 Location 头注入。"""
+    if not isinstance(uri, str) or not uri:
+        return False
+    if any(ord(c) < 0x20 or ord(c) == 0x7F for c in uri):
+        return False
+    try:
+        p = urllib.parse.urlparse(uri)
+    except Exception:
+        return False
+    if p.scheme not in ("https", "http") or not p.netloc:
+        return False
+    if p.scheme == "http" and p.hostname not in ("127.0.0.1", "localhost", "::1"):
+        return False
+    return True
+
+
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -15,12 +38,18 @@ PIN = os.environ.get("GEMINI_MCP_PIN") or "".join(secrets.choice("0123456789") f
 PUBLIC_HOST = os.environ.get("GEMINI_MCP_PUBLIC_HOST", "").strip().lower()
 AUDIT_LOG = os.environ.get("GEMINI_MCP_AUDIT_LOG") or os.path.join(BASE_DIR, "audit.log")
 
+MAX_BODY = 1024 * 1024            # 单请求体上限（字节）
+MAX_OUTPUT = 30000                # 命令输出上限（字节）
+MAX_AUDIT_SIZE = 1024 * 1024      # 审计日志轮转阈值
+MAX_CONCURRENT_COMMANDS = 4
+
 CLIENTS = {}
 AUTH_CODES = {}
 TOKENS = {}
 SESSIONS = set()
 LOCK = threading.Lock()
 AUDIT_LOCK = threading.Lock()
+CMD_SEMAPHORE = threading.BoundedSemaphore(MAX_CONCURRENT_COMMANDS)
 
 # PIN 暴力破解防护：窗口期内的失败次数上限
 MAX_PIN_FAILS = 5
@@ -30,9 +59,15 @@ PIN_FAILS = {"count": 0, "first": 0.0}
 
 def audit(event):
     """安全审计：记录鉴权事件与命令调用，失败不影响主流程。"""
+    event = event.replace("\r", "\\r").replace("\n", "\\n")
     try:
         line = time.strftime("%Y-%m-%d %H:%M:%S") + " " + event + "\n"
         with AUDIT_LOCK:
+            try:
+                if os.path.getsize(AUDIT_LOG) > MAX_AUDIT_SIZE:
+                    os.replace(AUDIT_LOG, AUDIT_LOG + ".1")
+            except OSError:
+                pass
             with open(AUDIT_LOG, "a", encoding="utf-8") as f:
                 f.write(line)
     except Exception:
@@ -68,24 +103,43 @@ TOOLS = [
 ]
 
 def pkce_ok(verifier, challenge):
-    digest = hashlib.sha256(verifier.encode("ascii")).digest()
+    if not isinstance(verifier, str) or not (43 <= len(verifier) <= 128):
+        return False
+    try:
+        digest = hashlib.sha256(verifier.encode("ascii")).digest()
+    except UnicodeEncodeError:
+        return False
     expected = base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
     return secrets.compare_digest(expected, challenge or "")
 
 def run_shell(cmd, timeout):
     # 先切到 UTF-8 代码页，避免中文 Windows 下 cmd 默认 GBK 导致输出乱码
     cmd = "chcp 65001 >nul && " + cmd
-    # 参数列表形式调起 cmd.exe (无外层 shell 字符串拼接)
-    r = subprocess.run(["cmd.exe", "/d", "/s", "/c", cmd],
-                       shell=False, cwd=ROOT, capture_output=True,
-                       timeout=timeout, encoding="utf-8", errors="replace")
-    out = (r.stdout or "") + (("\n[stderr]\n" + r.stderr) if r.stderr else "")
-    if len(out) > 30000:
-        out = out[:30000] + "\n...[输出已截断]"
-    return "exit_code=" + str(r.returncode) + "\n\n" + (out or "(无输出)")
+    # 输出先写临时文件，避免 capture_output 把超大输出一次性读进内存
+    with tempfile.TemporaryFile(mode="w+b") as fo, tempfile.TemporaryFile(mode="w+b") as fe:
+        p = subprocess.Popen(["cmd.exe", "/d", "/s", "/c", cmd],
+                             shell=False, cwd=ROOT, stdout=fo, stderr=fe)
+        try:
+            rc = p.wait(timeout=timeout)
+            timed_out = False
+        except subprocess.TimeoutExpired:
+            p.kill()
+            p.wait()
+            rc, timed_out = -1, True
+        fo.seek(0)
+        fe.seek(0)
+        out = fo.read(MAX_OUTPUT).decode("utf-8", errors="replace")
+        err = fe.read(max(0, MAX_OUTPUT - len(out))).decode("utf-8", errors="replace")
+    if timed_out:
+        return "exit_code=" + str(rc) + "\n\n[超时] 命令超过 " + str(timeout) + " 秒，已终止。\n" + out
+    text = out + (("\n[stderr]\n" + err) if err else "")
+    if len(text) > MAX_OUTPUT:
+        text = text[:MAX_OUTPUT] + "\n...[输出已截断]"
+    return "exit_code=" + str(rc) + "\n\n" + (text or "(无输出)")
 
 class Handler(BaseHTTPRequestHandler):
     server_version = "GeminiRemoteMCP/1.0"
+    timeout = 30  # 防止慢速连接长期占用线程
 
     def log_message(self, fmt, *args):
         pass
@@ -97,6 +151,9 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         # 不开放 CORS：MCP/OAuth 客户端不是浏览器，公网隧道下 "*" 会让恶意网页
         # 直接跨域读写本机服务（含 /token、/mcp），且配合 localhost 绑定绕过防护。
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Content-Security-Policy",
+                         "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'")
         for k, v in (extra or {}).items():
             self.send_header(k, v)
         self.end_headers()
@@ -117,6 +174,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def _form(self):
         n = int(self.headers.get("Content-Length", 0) or 0)
+        if n > MAX_BODY:
+            raise TooLarge()
         raw = self.rfile.read(n).decode("utf-8", errors="replace")
         ct = self.headers.get("Content-Type") or ""
         if "json" in ct:
@@ -128,7 +187,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = urllib.parse.urlparse(self.path).path
-        if path == "/.well-known/oauth-protected-resource":
+        if path in ("/.well-known/oauth-protected-resource", "/.well-known/oauth-protected-resource/mcp"):
             base = self._base_url()
             self._json({"resource": base + "/mcp", "authorization_servers": [base], "scopes_supported": ["mcp"], "bearer_methods": ["header"]})
         elif path == "/.well-known/oauth-authorization-server":
@@ -156,9 +215,12 @@ class Handler(BaseHTTPRequestHandler):
                 self._mcp()
             else:
                 self._json({"error": "not found"}, 404)
+        except TooLarge:
+            self._json({"error": "payload too large"}, 413)
         except Exception as e:
+            audit("internal error: " + str(e)[:200])
             try:
-                self._json({"error": "internal", "detail": str(e)[:300]}, 500)
+                self._json({"error": "internal"}, 500)
             except Exception:
                 pass
 
@@ -168,8 +230,12 @@ class Handler(BaseHTTPRequestHandler):
         ruri = body.get("redirect_uris") or body.get("redirect_uri") or []
         if isinstance(ruri, str):
             ruri = [ruri]
+        if isinstance(ruri, list):
+            ruri = [u for u in ruri if valid_redirect_uri(u)]
+        else:
+            ruri = []
         if not ruri:
-            self._json({"error": "invalid_client_metadata", "error_description": "redirect_uris required"}, 400)
+            self._json({"error": "invalid_client_metadata", "error_description": "redirect_uris required or invalid"}, 400)
             return
         client_id = "gc_" + secrets.token_hex(8)
         CLIENTS[client_id] = {"redirect_uris": ruri, "client_name": str(body.get("client_name") or "unknown-client")[:80]}
@@ -184,7 +250,7 @@ class Handler(BaseHTTPRequestHandler):
         scope = q.get("scope", "mcp")
         resp_type = q.get("response_type", "code")
         cli = CLIENTS.get(client_id)
-        if (not cli) or (redirect_uri not in cli["redirect_uris"]) or resp_type != "code" or not challenge:
+        if (not cli) or (not valid_redirect_uri(redirect_uri)) or (redirect_uri not in cli["redirect_uris"]) or resp_type != "code" or not challenge:
             self._send(400, "<h2>invalid authorize request</h2>", "text/html")
             return
         hidden = {"client_id": client_id, "redirect_uri": redirect_uri, "code_challenge": challenge, "state": state, "scope": scope}
@@ -214,7 +280,11 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(429, "<html><body><h2>尝试次数过多，请 " + str(PIN_FAIL_WINDOW) + " 秒后重试。</h2></body></html>", "text/html")
                 return
         pin = str(f.get("pin", "")).strip()
-        if len(pin) != 6 or not pin.isdigit() or not secrets.compare_digest(pin, PIN):
+        try:
+            pin_ok = secrets.compare_digest(pin, PIN)
+        except (TypeError, ValueError):
+            pin_ok = False
+        if not pin_ok:
             with LOCK:
                 PIN_FAILS["count"] += 1
             audit("PIN 校验失败 from " + self.client_address[0])
@@ -229,7 +299,7 @@ class Handler(BaseHTTPRequestHandler):
         state = f.get("state", "")
         scope = f.get("scope", "mcp")
         cli = CLIENTS.get(client_id)
-        if (not cli) or (redirect_uri not in cli["redirect_uris"]) or not challenge:
+        if (not cli) or (not valid_redirect_uri(redirect_uri)) or (redirect_uri not in cli["redirect_uris"]) or not challenge:
             self._send(400, "<h2>authorize failed</h2>", "text/html")
             return
         code = secrets.token_hex(24)
@@ -237,8 +307,10 @@ class Handler(BaseHTTPRequestHandler):
             AUTH_CODES[code] = {"client_id": client_id, "redirect_uri": redirect_uri, "challenge": challenge, "scope": scope, "expires": time.time() + 300}
         sep = "&" if "?" in redirect_uri else "?"
         loc = redirect_uri + sep + "code=" + urllib.parse.quote(code) + "&state=" + urllib.parse.quote(state)
+        loc = loc.replace("\r", "").replace("\n", "")
         self.send_response(302)
         self.send_header("Location", loc)
+        self.send_header("X-Frame-Options", "DENY")
         self.send_header("Content-Length", "0")
         self.end_headers()
 
@@ -284,7 +356,12 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             n = int(self.headers.get("Content-Length", 0) or 0)
+            if n > MAX_BODY:
+                raise TooLarge()
             msg = json.loads(self.rfile.read(n) or b"null")
+        except TooLarge:
+            self._json({"error": "payload too large"}, 413)
+            return
         except Exception:
             self._json({"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Parse error"}}, 400)
             return
@@ -328,8 +405,13 @@ class Handler(BaseHTTPRequestHandler):
             if len(cmd) > 4000:
                 raise ValueError("命令过长")
             timeout = min(max(int(a.get("timeout", 60)), 1), 300)
-            audit("run_command from " + self.client_address[0] + ": " + cmd[:500])
-            return run_shell(cmd, timeout)
+            if not CMD_SEMAPHORE.acquire(timeout=5):
+                raise ValueError("并发命令过多，请稍后重试")
+            try:
+                audit("run_command from " + self.client_address[0] + ": " + cmd[:500])
+                return run_shell(cmd, timeout)
+            finally:
+                CMD_SEMAPHORE.release()
         raise ValueError("未知工具: " + str(name))
 
 def main():

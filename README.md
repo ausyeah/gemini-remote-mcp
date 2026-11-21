@@ -17,7 +17,7 @@
 
 ## 这是什么
 
-一个 300 行纯 Python 标准库实现的 MCP 服务端（零依赖），通过 Cloudflare 隧道暴露为公网 HTTPS，供 Gemini App 作为自定义关联应用连接。**已实测可用：**
+一个纯 Python 标准库单文件实现的 MCP 服务端（零依赖），通过 Cloudflare 隧道暴露为公网 HTTPS，供 Gemini App 作为自定义关联应用连接。**已实测可用：**
 
 | 测试 | 结果 |
 | --- | --- |
@@ -95,6 +95,9 @@ start.bat
 - `run_command` 以**你的用户身份执行任意命令**——这就是本项目的功能本身。授权有三层（隧道不公开、PIN、Gemini 侧随时可禁用），但请务必理解你授予了什么
 - **PIN 与隧道地址不要发到任何公开场合**；本仓库文件不含你的任何个人运行时信息
 - token 存内存，服务重启即失效；连接器可在 Gemini「关联的应用」随时移除
+- PIN 错误 5 次（5 分钟窗口）会暂时锁定；审计日志写入 `audit.log`（超过 1MB 轮转为 `audit.log.1`），记录 PIN 校验、token 签发与执行的命令
+- 可选环境变量：`GEMINI_MCP_PORT`、`GEMINI_MCP_ROOT`、`GEMINI_MCP_PIN`、`GEMINI_MCP_PUBLIC_HOST`（显式声明公网域名，避免 OAuth 元数据被 Host 头注入）、`GEMINI_MCP_AUDIT_LOG`
+- `stop.bat` 只停止本次由 `start.bat` 启动的进程（依据 `server.pid` / `tunnel.pid`），不会误杀机器上其它 cloudflared
 - 长期使用建议：登录 tailscale 换固定域名（quick tunnel 重启会换地址），或自行加 Named Tunnel
 
 ## FAQ
