@@ -50,7 +50,9 @@ if "!PIN_VAL!"=="" (
 )
 
 echo [2/2] 正在启动 Cloudflare 临时隧道...
-start "gemini-cloudflared" /b cmd /c ""%CF_CMD%" tunnel --url http://127.0.0.1:8000 --logfile tunnel.log >nul 2>&1"
+:: 隧道端口必须与 mcp_server.py 的监听端口一致；未显式设置时默认 8787
+if not defined GEMINI_MCP_PORT set "GEMINI_MCP_PORT=8787"
+start "gemini-cloudflared" /b cmd /c ""%CF_CMD%" tunnel --url http://127.0.0.1:%GEMINI_MCP_PORT% --logfile tunnel.log >nul 2>&1"
 
 set "TUNNEL_URL="
 for /l %%i in (1,1,20) do (

@@ -6,16 +6,48 @@ def html_escape(s):
     return html_mod.escape(str(s), quote=True)
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.environ.get("GEMINI_MCP_ROOT") or os.path.join(os.path.expanduser("~"), "gemini-remote-work")
 os.makedirs(ROOT, exist_ok=True)
 PORT = int(os.environ.get("GEMINI_MCP_PORT", "8787"))
 PIN = os.environ.get("GEMINI_MCP_PIN") or "".join(secrets.choice("0123456789") for _ in range(6))
+# 可选：显式声明公网域名，使 OAuth metadata 不依赖客户端传入的 Host 头
+PUBLIC_HOST = os.environ.get("GEMINI_MCP_PUBLIC_HOST", "").strip().lower()
+AUDIT_LOG = os.environ.get("GEMINI_MCP_AUDIT_LOG") or os.path.join(BASE_DIR, "audit.log")
 
 CLIENTS = {}
 AUTH_CODES = {}
 TOKENS = {}
 SESSIONS = set()
 LOCK = threading.Lock()
+AUDIT_LOCK = threading.Lock()
+
+# PIN 暴力破解防护：窗口期内的失败次数上限
+MAX_PIN_FAILS = 5
+PIN_FAIL_WINDOW = 300
+PIN_FAILS = {"count": 0, "first": 0.0}
+
+
+def audit(event):
+    """安全审计：记录鉴权事件与命令调用，失败不影响主流程。"""
+    try:
+        line = time.strftime("%Y-%m-%d %H:%M:%S") + " " + event + "\n"
+        with AUDIT_LOCK:
+            with open(AUDIT_LOG, "a", encoding="utf-8") as f:
+                f.write(line)
+    except Exception:
+        pass
+
+
+def sweep():
+    """惰性清理过期的授权码与 token，避免长期运行内存增长。"""
+    now = time.time()
+    with LOCK:
+        for k in [k for k, v in AUTH_CODES.items() if v["expires"] < now]:
+            AUTH_CODES.pop(k, None)
+        for k in [k for k, v in TOKENS.items() if v["expires"] < now]:
+            TOKENS.pop(k, None)
+
 
 TOOLS = [
     {
@@ -41,6 +73,8 @@ def pkce_ok(verifier, challenge):
     return secrets.compare_digest(expected, challenge or "")
 
 def run_shell(cmd, timeout):
+    # 先切到 UTF-8 代码页，避免中文 Windows 下 cmd 默认 GBK 导致输出乱码
+    cmd = "chcp 65001 >nul && " + cmd
     # 参数列表形式调起 cmd.exe (无外层 shell 字符串拼接)
     r = subprocess.run(["cmd.exe", "/d", "/s", "/c", cmd],
                        shell=False, cwd=ROOT, capture_output=True,
@@ -61,9 +95,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", ctype + ("; charset=utf-8" if ("text" in ctype or "json" in ctype) else ""))
         self.send_header("Content-Length", str(len(data)))
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, Mcp-Session-Id, Mcp-Protocol-Version")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        # 不开放 CORS：MCP/OAuth 客户端不是浏览器，公网隧道下 "*" 会让恶意网页
+        # 直接跨域读写本机服务（含 /token、/mcp），且配合 localhost 绑定绕过防护。
         for k, v in (extra or {}).items():
             self.send_header(k, v)
         self.end_headers()
@@ -79,7 +112,8 @@ class Handler(BaseHTTPRequestHandler):
         return self.headers.get("Host", "127.0.0.1:" + str(PORT))
 
     def _base_url(self):
-        return "https://" + self._host()
+        # 优先用显式配置的公网域名，避免 OAuth metadata 被 Host 头注入污染
+        return "https://" + (PUBLIC_HOST or self._host())
 
     def _form(self):
         n = int(self.headers.get("Content-Length", 0) or 0)
@@ -105,7 +139,7 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/mcp":
             self._send(405, json.dumps({"error": "use POST"}), "application/json")
         elif path == "/healthz":
-            self._json({"ok": True, "root": ROOT})
+            self._json({"ok": True})
         else:
             self._json({"error": "not found"}, 404)
 
@@ -129,6 +163,7 @@ class Handler(BaseHTTPRequestHandler):
                 pass
 
     def _register(self):
+        sweep()
         body = self._form()
         ruri = body.get("redirect_uris") or body.get("redirect_uri") or []
         if isinstance(ruri, str):
@@ -158,22 +193,36 @@ class Handler(BaseHTTPRequestHandler):
                 "<style>body{font-family:system-ui;max-width:520px;margin:48px auto;padding:0 20px}"
                 ".btn{display:block;width:100%;padding:12px;margin-top:16px;background:#0a7;color:#fff;border:0;border-radius:8px;font-size:16px;cursor:pointer}"
                 "input{padding:10px;font-size:16px;width:120px;margin-top:10px}.mut{color:#888;font-size:13px}</style></head><body>"
-                "<h2>允许远程工作连接?</h2><p><b>" + cli["client_name"] + "</b> 请求连接这台电脑的 Gemini 远程工作服务。</p>"
+                "<h2>允许远程工作连接?</h2><p><b>" + html_escape(cli["client_name"]) + "</b> 请求连接这台电脑的 Gemini 远程工作服务。</p>"
                 "授权后它将可以: 在工作目录执行命令、读写文件。<br/>"
                 "请输入服务启动时生成的授权 PIN: "
                 "<form method=POST action=/approve>" + fields +
                 "<input name=pin inputmode=numeric autocomplete=off required/>"
                 "<button class=btn type=submit>允许 (Approve)</button></form>"
-                "<p class=mut>scope: " + scope + "</p>"
+                "<p class=mut>scope: " + html_escape(scope) + "</p>"
                 "</body></html>")
         self._send(200, html, "text/html")
 
     def _approve(self):
         f = self._form()
+        now = time.time()
+        with LOCK:
+            if now - PIN_FAILS["first"] >= PIN_FAIL_WINDOW:
+                PIN_FAILS["count"] = 0
+                PIN_FAILS["first"] = now
+            if PIN_FAILS["count"] >= MAX_PIN_FAILS:
+                self._send(429, "<html><body><h2>尝试次数过多，请 " + str(PIN_FAIL_WINDOW) + " 秒后重试。</h2></body></html>", "text/html")
+                return
         pin = str(f.get("pin", "")).strip()
-        if not secrets.compare_digest(pin, PIN):
+        if len(pin) != 6 or not pin.isdigit() or not secrets.compare_digest(pin, PIN):
+            with LOCK:
+                PIN_FAILS["count"] += 1
+            audit("PIN 校验失败 from " + self.client_address[0])
             self._send(403, "<html><body><h2>PIN 错误</h2><p>请使用服务启动时打印的 PIN。</p></body></html>", "text/html")
             return
+        with LOCK:
+            PIN_FAILS["count"] = 0
+        audit("PIN 校验通过 from " + self.client_address[0])
         client_id = f.get("client_id", "")
         redirect_uri = f.get("redirect_uri", "")
         challenge = f.get("code_challenge", "")
@@ -199,7 +248,9 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": "unsupported_grant_type"}, 400)
             return
         code = f.get("code", "")
-        rec = AUTH_CODES.get(code)
+        # 原子取出并删除授权码，避免并发请求重复兑换同一 code
+        with LOCK:
+            rec = AUTH_CODES.pop(code, None)
         if (not rec) or rec["expires"] < time.time():
             self._json({"error": "invalid_grant", "error_description": "code expired or unknown"}, 400)
             return
@@ -211,9 +262,9 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": "invalid_grant", "error_description": "PKCE verification failed"}, 400)
             return
         with LOCK:
-            AUTH_CODES.pop(code, None)
             token = "gt_" + secrets.token_hex(24)
             TOKENS[token] = {"client_id": rec["client_id"], "expires": time.time() + 86400 * 7, "scope": rec.get("scope", "mcp")}
+        audit("token issued for client " + rec["client_id"])
         self._json({"access_token": token, "token_type": "Bearer", "expires_in": 86400 * 7, "scope": rec.get("scope", "mcp")})
 
     def _authed(self):
@@ -277,13 +328,15 @@ class Handler(BaseHTTPRequestHandler):
             if len(cmd) > 4000:
                 raise ValueError("命令过长")
             timeout = min(max(int(a.get("timeout", 60)), 1), 300)
+            audit("run_command from " + self.client_address[0] + ": " + cmd[:500])
             return run_shell(cmd, timeout)
         raise ValueError("未知工具: " + str(name))
 
 def main():
-    pin_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pin.txt")
+    pin_file = os.path.join(BASE_DIR, "pin.txt")
     with open(pin_file, "w", encoding="utf-8") as f:
         f.write(PIN)
+    audit("server started, port=" + str(PORT) + ", root=" + ROOT)
     print("[gemini-mcp] 工作目录 = " + ROOT)
     print("[gemini-mcp] 本轮授权 PIN = " + PIN)
     print("[gemini-mcp] listening on http://127.0.0.1:" + str(PORT))

@@ -2,6 +2,7 @@
 pin.txt
 server.log
 tunnel.log
+audit.log
 
 # 本地隧道可执行文件
 cloudflared.exe
